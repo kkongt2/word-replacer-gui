@@ -226,7 +226,7 @@ class WordReplacerGUI:
 
         ttk.Label(act_top, text="Context lines:", background="#2e3440", foreground="#ECEFF4").pack(
             side="left", padx=(0, 5))
-        self.context_lines_spinbox = tk.Spinbox(act_top, from_=0, to=10, textvariable=self.context_lines_var,
+        self.context_lines_spinbox = tk.Spinbox(act_top, from_=0, to=30, textvariable=self.context_lines_var,
                                                 width=3, command=self.schedule_preview)
         self.context_lines_spinbox.pack(side="left", padx=(0, 10))
         self.context_lines_spinbox.bind("<KeyRelease>", lambda e: self.schedule_preview())
