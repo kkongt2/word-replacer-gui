@@ -40,6 +40,36 @@ class WordReplacerGUI:
     MAP_MODE_DELETE_WORD = "delete-word"
     MAP_MODE_DELETE_LINE = "delete-line"
     MAP_MODE_INVALID = "invalid"
+    ENCODING_AUTO = "Auto detect"
+    ENCODING_UTF8 = "UTF-8"
+    ENCODING_UTF8_BOM = "UTF-8 BOM"
+    ENCODING_CP949 = "CP949"
+    ENCODING_EUCKR = "EUC-KR"
+    ENCODING_OPTIONS = (
+        ENCODING_AUTO,
+        ENCODING_UTF8,
+        ENCODING_UTF8_BOM,
+        ENCODING_CP949,
+        ENCODING_EUCKR,
+    )
+    ENCODING_CODECS = {
+        ENCODING_UTF8: "utf-8",
+        ENCODING_UTF8_BOM: "utf-8-sig",
+        ENCODING_CP949: "cp949",
+        ENCODING_EUCKR: "euc-kr",
+    }
+    UTF8_BOM = b"\xef\xbb\xbf"
+    BACKUP_SIDECAR = "Sidecar .bak"
+    BACKUP_TIMESTAMPED = "Timestamped .bak"
+    BACKUP_FOLDER = "Backup folder"
+    BACKUP_NONE = "No backup"
+    BACKUP_OPTIONS = (
+        BACKUP_SIDECAR,
+        BACKUP_TIMESTAMPED,
+        BACKUP_FOLDER,
+        BACKUP_NONE,
+    )
+    BACKUP_DIR_NAME = "_word_replacer_backups"
     DELETE_LINE_MODE_ALIASES = {
         "delete-line",
         "line-delete",
@@ -346,7 +376,13 @@ class WordReplacerGUI:
         self.file_mapping_changes: dict[str, set[tuple[str, str, str]]] = {}
         self.file_cache: dict[str, str] = {}
         self.file_lower_cache: dict[str, str] = {}
+        self.file_encoding_cache: dict[str, str] = {}
+        self.last_backup_paths: dict[str, str] = {}
+        self.last_file_encodings: dict[str, str] = {}
         self.replace_scope_var = tk.StringVar(value="all")
+        self.encoding_mode = self.ENCODING_AUTO
+        self.encoding_var = tk.StringVar(value=self.ENCODING_AUTO)
+        self.backup_policy_var = tk.StringVar(value=self.BACKUP_SIDECAR)
 
         # 프리뷰 결과(텍스트/매치구간/라인시작오프셋)
         self._pv_text: str | None = None
@@ -617,6 +653,29 @@ class WordReplacerGUI:
         self.file_jump_btn = ttk.Button(nav_frame, text="Jump", command=self.jump_to_selected_file, width=7)
         self.file_jump_btn.grid(row=2, column=2, pady=(2, 0), sticky="e")
 
+        io_options_frame = ttk.Frame(act_bottom, style="Action.TFrame")
+        io_options_frame.pack(side="left", fill="x", expand=True)
+        ttk.Label(io_options_frame, text="Encoding", style="ActionMuted.TLabel").pack(side="left", padx=(0, 5))
+        self.encoding_combo = ttk.Combobox(
+            io_options_frame,
+            textvariable=self.encoding_var,
+            values=self.ENCODING_OPTIONS,
+            state="readonly",
+            width=13,
+        )
+        self.encoding_combo.pack(side="left", padx=(0, 14))
+        self.encoding_combo.bind("<<ComboboxSelected>>", self.on_encoding_changed)
+
+        ttk.Label(io_options_frame, text="Backup", style="ActionMuted.TLabel").pack(side="left", padx=(0, 5))
+        self.backup_policy_combo = ttk.Combobox(
+            io_options_frame,
+            textvariable=self.backup_policy_var,
+            values=self.BACKUP_OPTIONS,
+            state="readonly",
+            width=16,
+        )
+        self.backup_policy_combo.pack(side="left")
+
         btn_row_right = ttk.Frame(act_bottom, style="Action.TFrame")
         btn_row_right.pack(side="right")
 
@@ -698,20 +757,69 @@ class WordReplacerGUI:
             f, l = widget.xview()
             hsb.grid() if f > 0.0 or l < 1.0 else hsb.grid_remove()
 
+    def _normalize_encoding_mode(self, mode: str | None) -> str:
+        if mode in self.ENCODING_OPTIONS:
+            return mode
+        return self.ENCODING_AUTO
+
+    def _normalize_backup_policy(self, policy: str | None) -> str:
+        if policy in self.BACKUP_OPTIONS:
+            return policy
+        return self.BACKUP_SIDECAR
+
+    def _decode_file_bytes(self, path: str, raw: bytes) -> tuple[str, str]:
+        mode = self._normalize_encoding_mode(self.encoding_mode)
+        if mode != self.ENCODING_AUTO:
+            codec = self.ENCODING_CODECS[mode]
+            try:
+                return raw.decode(codec), codec
+            except UnicodeDecodeError as ex:
+                raise OSError(f"Failed to decode with {mode}: {path}") from ex
+
+        if raw.startswith(self.UTF8_BOM):
+            try:
+                return raw.decode("utf-8-sig"), "utf-8-sig"
+            except UnicodeDecodeError:
+                pass
+
+        for codec in ("utf-8", "cp949", "euc-kr"):
+            try:
+                return raw.decode(codec), codec
+            except UnicodeDecodeError:
+                continue
+        raise OSError(f"Failed to auto-detect encoding: {path}")
+
+    def _read_file_with_encoding(self, path: str) -> tuple[str, str]:
+        try:
+            raw = Path(path).read_bytes()
+            return self._decode_file_bytes(path, raw)
+        except OSError:
+            raise
+        except Exception as ex:
+            raise OSError(f"Failed to read file: {path}") from ex
+
     def _get_file_text(self, path: str) -> str:
         if path in self.file_cache:
             return self.file_cache[path]
-        txt = None
-        for enc, errs in (("utf-8", "strict"), ("cp949", "strict"), ("euc-kr", "ignore"), ("utf-8", "ignore")):
-            try:
-                txt = Path(path).read_text(encoding=enc, errors=errs)
-                break
-            except Exception:
-                txt = None
-        if txt is None:
-            raise OSError(f"Failed to read file: {path}")
+        txt, encoding = self._read_file_with_encoding(path)
         self.file_cache[path] = txt
+        self.file_encoding_cache[path] = encoding
         return txt
+
+    def _get_file_encoding(self, path: str) -> str:
+        encoding = self.file_encoding_cache.get(path)
+        if encoding:
+            return encoding
+        self._get_file_text(path)
+        return self.file_encoding_cache[path]
+
+    def _open_text_reader(self, path: str):
+        encoding = self._get_file_encoding(path)
+        return open(path, "r", encoding=encoding, errors="strict", newline="", buffering=1 << 20)
+
+    def _write_file_text(self, path: str, text: str, encoding: str):
+        with open(path, "w", encoding=encoding, errors="strict", newline="") as fh:
+            fh.write(text)
 
     def _clear_cached_file_derivatives(self, path: str | None = None):
         if path is None:
@@ -1078,6 +1186,8 @@ class WordReplacerGUI:
             self.context_chars_scale.state(["disabled"])
             self.browse_btn.state(["disabled"])
             self.clear_btn.state(["disabled"])
+            self.encoding_combo.state(["disabled"])
+            self.backup_policy_combo.state(["disabled"])
             self.copy_preview_btn.state(["disabled"])
             self.cancel_btn.state(["!disabled"])
         else:
@@ -1091,6 +1201,8 @@ class WordReplacerGUI:
             self.context_chars_scale.state(["!disabled"])
             self.browse_btn.state(["!disabled"])
             self.clear_btn.state(["!disabled"])
+            self.encoding_combo.state(["!disabled"])
+            self.backup_policy_combo.state(["!disabled"])
             self.copy_preview_btn.state(["!disabled"])
             self.cancel_btn.state(["disabled"])
 
@@ -1122,6 +1234,14 @@ class WordReplacerGUI:
         self._highlight_mapping()
         self.schedule_preview()
         self._refresh_action_state()
+
+    def on_encoding_changed(self, event=None):
+        self.encoding_mode = self._normalize_encoding_mode(self.encoding_var.get())
+        self.encoding_var.set(self.encoding_mode)
+        self.file_cache.clear()
+        self.file_encoding_cache.clear()
+        self._clear_cached_file_derivatives()
+        self.schedule_preview()
 
     def on_context_chars_changed(self, *_):
         self.context_chars_label.config(text=str(self.context_chars_var.get()))
@@ -1213,6 +1333,7 @@ class WordReplacerGUI:
     def on_clear(self):
         self.file_listbox.delete(0, tk.END)
         self.file_cache.clear()
+        self.file_encoding_cache.clear()
         self._clear_cached_file_derivatives()
         self.delete_line_selection_overrides.clear()
         self.log("File list cleared")
@@ -1223,6 +1344,7 @@ class WordReplacerGUI:
             removed = self.file_listbox.get(i)
             self.file_listbox.delete(i)
             self.file_cache.pop(removed, None)
+            self.file_encoding_cache.pop(removed, None)
             self._clear_cached_file_derivatives(removed)
             file_key = os.path.normcase(os.path.abspath(removed))
             self.delete_line_selection_overrides = {
@@ -1365,6 +1487,11 @@ class WordReplacerGUI:
                 self.context_line_mode_var.set(
                     self._normalize_context_line_mode(data.get("context_line_mode", self.CONTEXT_LINE_MODE_BOTH))
                 )
+                self.encoding_mode = self._normalize_encoding_mode(data.get("encoding_mode", self.ENCODING_AUTO))
+                self.encoding_var.set(self.encoding_mode)
+                self.backup_policy_var.set(
+                    self._normalize_backup_policy(data.get("backup_policy", self.BACKUP_SIDECAR))
+                )
                 self._highlight_mapping()
             except Exception:
                 pass
@@ -1376,6 +1503,8 @@ class WordReplacerGUI:
             "context_lines": int(self.context_lines_var.get()),
             "context_chars": int(self.context_chars_var.get()),
             "context_line_mode": self._normalize_context_line_mode(self.context_line_mode_var.get()),
+            "encoding_mode": self._normalize_encoding_mode(self.encoding_var.get()),
+            "backup_policy": self._normalize_backup_policy(self.backup_policy_var.get()),
         }
         try:
             SESSION_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1784,15 +1913,7 @@ class WordReplacerGUI:
                 # 선행 문맥 라인 저장(공유)
                 prev_lines = deque(maxlen=max(0, ctx_lines)) if show_above else None
 
-                fh = None
-                for enc in ("utf-8", "cp949", "euc-kr"):
-                    try:
-                        fh = open(f, "r", encoding=enc, errors="ignore", newline="", buffering=1<<20)
-                        break
-                    except Exception:
-                        fh = None; continue
-                if fh is None:
-                    fh = open(f, "r", encoding="utf-8", errors="ignore", newline="", buffering=1<<20)
+                fh = self._open_text_reader(f)
 
                 with fh:
                     for ln_no, line in enumerate(fh, 1):
@@ -1941,15 +2062,7 @@ class WordReplacerGUI:
             last_printed_line = [None] * N
             prev_lines = deque(maxlen=max(0, ctx_lines)) if show_above else None
 
-            fh = None
-            for enc in ("utf-8", "cp949", "euc-kr"):
-                try:
-                    fh = open(f, "r", encoding=enc, errors="ignore", newline="", buffering=1<<20)
-                    break
-                except Exception:
-                    fh = None; continue
-            if fh is None:
-                fh = open(f, "r", encoding="utf-8", errors="ignore", newline="", buffering=1<<20)
+            fh = self._open_text_reader(f)
 
             with fh:
                 for ln_no, line in enumerate(fh, 1):
@@ -2435,15 +2548,7 @@ class WordReplacerGUI:
             post_remain = 0
             last_printed_line = None
 
-            fh = None
-            for enc in ("utf-8", "cp949", "euc-kr"):
-                try:
-                    fh = open(f, "r", encoding=enc, errors="ignore", newline="", buffering=1<<20)
-                    break
-                except Exception:
-                    fh = None; continue
-            if fh is None:
-                fh = open(f, "r", encoding="utf-8", errors="ignore", newline="", buffering=1<<20)
+            fh = self._open_text_reader(f)
 
             basename = os.path.basename(f)
             with fh:
@@ -2640,6 +2745,38 @@ class WordReplacerGUI:
                 kept.append(line)
         return "".join(kept), removed
 
+    def _make_backup_run_id(self) -> str:
+        return f"{time.strftime('%Y%m%d-%H%M%S')}-{int((time.time() % 1) * 1000):03d}"
+
+    def _backup_policy_description(self, policy: str) -> str:
+        policy = self._normalize_backup_policy(policy)
+        if policy == self.BACKUP_NONE:
+            return "Backups will not be created. Undo is unavailable for this run."
+        if policy == self.BACKUP_TIMESTAMPED:
+            return "Timestamped .bak files will be created next to each source file."
+        if policy == self.BACKUP_FOLDER:
+            return f"Backups will be stored in {self.BACKUP_DIR_NAME} folders."
+        return "Backup files (*.bak) will be created next to each source file."
+
+    def _make_backup_path(self, file_path: str, policy: str, run_id: str) -> str | None:
+        policy = self._normalize_backup_policy(policy)
+        if policy == self.BACKUP_NONE:
+            return None
+        src = Path(file_path)
+        if policy == self.BACKUP_TIMESTAMPED:
+            return str(src.with_name(f"{src.name}.{run_id}.bak"))
+        if policy == self.BACKUP_FOLDER:
+            return str(src.parent / self.BACKUP_DIR_NAME / run_id / src.name)
+        return file_path + ".bak"
+
+    def _create_backup(self, file_path: str, policy: str, run_id: str) -> str | None:
+        backup_path = self._make_backup_path(file_path, policy, run_id)
+        if backup_path is None:
+            return None
+        Path(backup_path).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(file_path, backup_path)
+        return backup_path
+
     def start_replace(self):
         if self.is_replacing:
             return
@@ -2676,9 +2813,11 @@ class WordReplacerGUI:
         if delete_line_count:
             operation_bits.append(f"{delete_line_count} line delete")
         operation_label = ", ".join(operation_bits)
+        backup_policy = self._normalize_backup_policy(self.backup_policy_var.get())
         confirm_message = (
             f"Apply {len(pairs)} mapping(s) ({operation_label}) in {len(files)} {scope_label}?\n"
-            "Backup files (*.bak) will be created next to each source file."
+            f"{self._backup_policy_description(backup_policy)}\n"
+            "Files will be saved with the encoding used when they were read."
         )
         if not messagebox.askokcancel("Confirm Replace", confirm_message):
             return
@@ -2687,8 +2826,9 @@ class WordReplacerGUI:
         self.replace_status_label.config(text=f"Running updates in {len(files)} file(s)...")
         self.replace_cancel_event.clear()
         self._set_replace_running(True)
+        backup_run_id = self._make_backup_run_id()
         self.replace_thread = threading.Thread(
-            target=self.run_replace, args=(files, pairs, regex, case, flags), daemon=True
+            target=self.run_replace, args=(files, pairs, regex, case, flags, backup_policy, backup_run_id), daemon=True
         )
         self.replace_thread.start()
 
@@ -2699,8 +2839,10 @@ class WordReplacerGUI:
         self.cancel_btn.state(["disabled"])
         self.replace_status_label.config(text="Cancel requested. Finishing current file...")
 
-    def run_replace(self, files, pairs, regex, case, flags):
+    def run_replace(self, files, pairs, regex, case, flags, backup_policy, backup_run_id):
         self.last_replaced.clear()
+        self.last_backup_paths.clear()
+        self.last_file_encodings.clear()
         self.total_replacements = 0
         self.file_mapping_changes.clear()
 
@@ -2722,6 +2864,7 @@ class WordReplacerGUI:
                 txt = self._get_file_text(f)
                 new = txt
                 fm = set()
+                file_replacements = 0
                 if use_literal_case_sensitive_fastpath:
                     for mapping in pairs:
                         s = self._mapping_src(mapping)
@@ -2729,7 +2872,7 @@ class WordReplacerGUI:
                         cnt = new.count(s)
                         if cnt:
                             new = new.replace(s, d)
-                            self.total_replacements += cnt
+                            file_replacements += cnt
                             fm.add(mapping)
                 else:
                     for mode, patt, repl, mapping in compiled:
@@ -2738,16 +2881,21 @@ class WordReplacerGUI:
                         else:
                             new, cnt = patt.subn(repl, new)
                         if cnt:
-                            self.total_replacements += cnt
+                            file_replacements += cnt
                             fm.add(mapping)
                 if new != txt:
-                    bak = f + ".bak"
-                    shutil.copy(f, bak)
-                    Path(f).write_text(new, encoding="utf-8")
+                    encoding = self._get_file_encoding(f)
+                    backup_path = self._create_backup(f, backup_policy, backup_run_id)
+                    self._write_file_text(f, new, encoding)
                     self.file_cache[f] = new
+                    self.file_encoding_cache[f] = encoding
                     self._clear_cached_file_derivatives(f)
-                    self.last_replaced.append(f)
+                    if backup_path:
+                        self.last_replaced.append(f)
+                        self.last_backup_paths[f] = backup_path
+                        self.last_file_encodings[f] = encoding
                     self.file_mapping_changes[f] = fm
+                    self.total_replacements += file_replacements
                 status = f"{i}/{len(files)} {os.path.basename(f)}"
             except Exception as ex:
                 status = f"Error {os.path.basename(f)}: {ex}"
@@ -2789,19 +2937,24 @@ class WordReplacerGUI:
             return
 
         for f in self.last_replaced:
-            bak = f + ".bak"
+            bak = self.last_backup_paths.get(f, f + ".bak")
             if os.path.exists(bak):
-                shutil.copy(bak, f)
-                try:
-                    self.file_cache[f] = Path(f).read_text(encoding="utf-8")
-                except UnicodeDecodeError:
-                    self.file_cache[f] = Path(f).read_text(encoding="euc-kr", errors="ignore")
+                shutil.copy2(bak, f)
+                encoding = self.last_file_encodings.get(f)
+                if encoding:
+                    txt = Path(f).read_bytes().decode(encoding)
+                else:
+                    txt, encoding = self._read_file_with_encoding(f)
+                self.file_cache[f] = txt
+                self.file_encoding_cache[f] = encoding
                 self._clear_cached_file_derivatives(f)
             fm = self.file_mapping_changes.get(f, set())
             desc = ", ".join(self._format_mapping_log_label(mapping) for mapping in fm)
             self.log(f"Restored {os.path.basename(f)}; Mappings: {desc}")
 
         self.last_replaced.clear()
+        self.last_backup_paths.clear()
+        self.last_file_encodings.clear()
         self.file_mapping_changes.clear()
         self.total_replacements = 0
         self.replace_status_label.config(text="Undo completed.")
