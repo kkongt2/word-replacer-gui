@@ -1326,7 +1326,7 @@ class WordReplacerGUI:
         )
 
     def on_browse(self):
-        files = filedialog.askopenfilenames(filetypes=[("Text Files", "*.txt"), ("All Files", "*.*")])
+        files = filedialog.askopenfilenames(filetypes=[("All Files", "*.*"), ("Text Files", "*.txt")])
         self._add_files(files, source="Browse Files")
         self.update_src_list()
 
